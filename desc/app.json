@@ -2,7 +2,7 @@
   "uuid": "<APP_UUID>",
   "name": "GPU Demo",
   "description": "A demo application showcasing graphics co-processing rendering on the RP2040 and Atari ST  <a target='_blank' rel='noopener noreferrer' href='https://docs.sidecartridge.com/sidecartridge-multidevice/microfirmwares/gpu-demo/'>Learn how</a>",
-  "image": "https://placehold.co/256x256/png",
+  "image": "https://raw.githubusercontent.com/sidecartridge/md-gpu-demo/main/icon.png",
   "tags": [
     "Demo",
     "GPU"

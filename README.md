@@ -1,10 +1,25 @@
-# md-gpu-demo
+<div align="center">
+
+<img src="icon.png" alt="GPU Demo" width="180" />
+
+# GPU Demo
+
+[![Build](https://github.com/sidecartridge/md-gpu-demo/actions/workflows/build.yml/badge.svg)](https://github.com/sidecartridge/md-gpu-demo/actions/workflows/build.yml)
+[![Release](https://github.com/sidecartridge/md-gpu-demo/actions/workflows/release.yml/badge.svg)](https://github.com/sidecartridge/md-gpu-demo/actions/workflows/release.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+
+</div>
 
 `md-gpu-demo` is a demoscene-oriented showcase built on top of
 [`md-framebuffer-template`](https://github.com/sidecartridge/md-framebuffer-template).
 It demonstrates what can be done when a SidecarTridge Multi-device
 cartridge, also known as **SidecarT**, works together with an Atari ST,
 STE, Mega ST, or Mega STE.
+
+> Learn how to install and use it:
+> <https://docs.sidecartridge.com/sidecartridge-multidevice/microfirmwares/gpu-demo/>
+
+> 🛒 **Get the hardware:** [SidecarTridge Multi-device](https://sidecartridge.com/products/sidecartridge-multidevice-atari-st/)
 
 The repository is not just a static framebuffer sample. It is a small
 intro/demo playground where the RP2040 in the SidecarT renders effects

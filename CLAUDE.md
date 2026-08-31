@@ -20,7 +20,7 @@ rephrase it. Cross-references *between* the epic docs themselves are fine
 
 ## What this repo is
 
-A template for building **sub-20-millisecond audiovisual Sidecartridge Multi-device microfirmware apps** for the Atari ST / STE / MegaST(E) — games, demos, and console/computer emulations where the speed of putting a colourful 320×200 screen up matters. Each "app" is a UF2 image that runs on a Raspberry Pi Pico (RP2040) plugged into the Multi-device cartridge slot, emulating a ROM cartridge for the Atari, while also handling SD card I/O and per-app config. You draw into a **320×200, 16-colour framebuffer** in the Pico's RAM and the firmware blits it to the ST screen every VBL (50 Hz) for you; keyboard input and YM audio come for free. The primary extension point is "draw into the framebuffer, the m68k blits it for you". Public build/usage docs are at <https://docs.sidecartridge.com/sidecartridge-multidevice/programming/>.
+`md-gpu-demo` — a demoscene showcase app built on the **`md-framebuffer-template`** framework (upstream: <https://github.com/sidecartridge/md-framebuffer-template>). The framework half of this repo is a template for **sub-20-millisecond audiovisual Sidecartridge Multi-device microfirmware apps** for the Atari ST / STE / MegaST(E) — games, demos, and console/computer emulations where the speed of putting a colourful 320×200 screen up matters. Each "app" is a UF2 image that runs on a Raspberry Pi Pico (RP2040) plugged into the Multi-device cartridge slot, emulating a ROM cartridge for the Atari, while also handling SD card I/O and per-app config. You draw into a **320×200, 16-colour framebuffer** in the Pico's RAM and the firmware blits it to the ST screen every VBL (50 Hz) for you; keyboard input and YM audio come for free. The primary extension point is "draw into the framebuffer, the m68k blits it for you". Public build/usage docs are at <https://docs.sidecartridge.com/sidecartridge-multidevice/programming/>.
 
 **You develop 100% on the RP2040 side — the framework does the heavy lifting:**
 - **Dual (page-flipped) framebuffer on the Atari ST side** — tear-free display, fully managed for you.
@@ -81,9 +81,59 @@ End-to-end, every visible pixel on the ST goes through this path each VBL:
 2. **RP publishes via chunky-to-planar conversion**. The chunked buffer is bit-transposed to ST planar 4 bpp by a hand-written Thumb assembly worker (`fb_chunked_asm.S` — `fb_c2p_half`). For each 4-pixel uint32 group, plane K's 4-bit nibble = `((q >> K) & 0x01010101) * 0x80402010 >> 28`. Work is split between **Core 0 (top 100 rows) and Core 1 (bottom 100 rows)**, synced via the inter-core FIFO. Both cores write into a 32 KB RP-RAM scratch (`fb_planar_scratch`) in natural row-major order; `fb_chunky_to_planar` then publishes the result into the cart FB at `$FA8300` (RP `0x20030000 + 0x8300`) with the 48-byte m68k MOVEM chunks **pre-reversed** (so the m68k's predec store in step 3 lands each chunk at its natural image position — see "Framebuffer chunk layout for the m68k MOVEM blit" in `cart_shared.h`). Total conversion time: ~1 ms c2p + ~60-120 µs chunk-reversed memcpy.
 3. **m68k blits cart FB → ST screen page** inside `userfw.s`'s VBL loop via the `FBDRV_INLINE` macro — a fully unrolled `movem.l (a6)+, d0-d7/a1-a4` load + `movem.l d0-d7/a1-a4, -(a5)` predec store (**12 longwords / 48 bytes per iter, 666 iterations** for the full 200-line low-res FB, plus a `d16(a5)` MOVEM tail copying the last 32 bytes). A0 and A7 are intentionally omitted from the MOVEM list: A0 is the dedicated Timer-B audio cursor (kept stable across the macro so the audio IRQ handler doesn't have to save/restore it), and A7 keeps the supervisor SP valid so IRQs can fire safely during the macro. Predec mode is 4 cyc/iter faster than `d16(a5)` (8+8n vs 12+8n on 68000), at the cost of writing each chunk in reverse memory order — which is exactly what the RP-side chunk-reversed cart FB layout from step 2 compensates for. A5 is initialised to `UFW_SCREEN_PAGE + 31968` (page end of chunked region) and decrements back to page start over the 666 iters. Pure 68000 CPU, no STE blitter, no `_MCH` cookie dispatch — same code runs on plain ST / STE / MegaSTE / TT / Falcon.
 4. **m68k flips video base** to the page it just wrote. `userfw.s` toggles between `$70000` and `$78000` every frame (`UFW_SCREEN_PAGE` XOR `UFW_SCREEN_XOR`), so the display always reads from a stable page while the next blit fills the other.
-5. **PALETTE_IDX0 (`$FFFF8240`) doubles as a timing tape-measure** — `userfw.s` writes it at three points (post-vsync, blit-start, blit-end) so the ST border shows the blit cost as colored bands. White band = `FBDRV_INLINE` in flight (~17 ms at FB_COPY_LINES=200). Green band = slack until next vsync.
+5. **m68k applies the RP-published palette** — before the blit, `.vbl_loop` copies the 32-byte palette slot at `$FA4040` into `$FFFF8240..$FFFF825E` with two MOVEMs (~20 µs). See "Palette pipeline" below.
+6. **Optional border timing tape-measure** — `FBDRV_DEBUG_MARKS` in `userfw.s` (**default `0` = off**) makes the VBL loop poke `PALETTE_IDX0` (`$FFFF8240`) at three points (post-vsync/black, blit-start/white, blit-end/green) so the ST border shows the blit cost as coloured bands. Set it to `1` only when measuring: it fights the per-frame palette publish and flickers anything drawn in palette index 0.
 
 The number of lines copied by `FBDRV_INLINE` is parameterized by `FB_COPY_LINES` (default 200). Leaving rows untouched lets an app keep a static status bar in the destination ST page that the FB blit never overwrites. `FBDRV_TOTAL_BYTES = FB_COPY_LINES * FB_ROW_BYTES` is divided by `FBDRV_ITER_BYTES = 48` to derive `FBDRV_MAIN_ITERS`; trailing bytes (at most 47) are picked up by a small `d16(a5)` MOVEM tail block emitted via `ifne FBDRV_TAIL_BYTES`. The tail's MOVEM register list must hold exactly `FBDRV_TAIL_BYTES / 4` longwords — at FB_COPY_LINES=200 the tail is 32 B (`d0-d7`); at 199 it's 16 B (`d0-d3`); at 198 it's 0 B (block skipped). Adjust the register list manually when changing FB_COPY_LINES.
+
+### VBL frame-sync handshake (`fb_publish`)
+
+`fb_publish()` is the one call every app/demo makes per frame, and it is
+**not** a plain memcpy — it is a three-phase handshake with the m68k that
+buys tear-free full 50 Hz:
+
+1. **Transpose to scratch** — dual-core c2p, chunked → `fb_planar_scratch`
+   (32 KB, RP RAM, natural row-major). ~1 ms, and it touches no cart memory,
+   so it overlaps the m68k blitting the *previous* frame.
+2. **Block on the m68k's ack** — after `.after_copy` the m68k does one
+   cart-bus read at `VBLSYNC_ADDR` = **`$FB8400`** (`userfw.s`). The RP sees
+   it in the commemul ROM3 ring (`FB_VBLSYNC_HIBYTE` in `fb.c`) and only then
+   knows the cart FB is free. While waiting it keeps calling `fb_pump_rom3()`,
+   so IKBD/ESC stay responsive. A ~60 ms timeout keeps boot from hanging when
+   the m68k isn't running yet.
+3. **Fast publish** — the ~120 µs chunk-reversed copy scratch → cart FB, then
+   bump `FB_FRAME_COUNTER`. This is the *only* cart-FB write, and it lands in
+   the m68k's post-blit slack.
+
+So there are **two ROM3 cart-read windows**, both drained by the single
+`fb_pump_rom3()` → `commemul_poll()` path: `$FB8200..$FB82FF` = IKBD bytes,
+`$FB8400` = VBL blit-done ack. Anything new the m68k wants to tell the RP
+should claim its own high-byte window the same way.
+
+`fb_last_convert_us()` reports the microseconds the last `fb_publish()` spent
+in phase 1+3; that is what the on-screen DRAW/C2P readout displays.
+
+### Palette pipeline
+
+The 16 ST hardware colours are **published by the RP, applied by the m68k**,
+so apps never write `$FFFF8240` themselves:
+
+- RP side: `palette.c` / `palette.h`. `palette_init()` publishes the default
+  16-colour set once at boot (idx 0 = white → matches `font_set_color(0)`;
+  idx 15 = black → matches `fb_clear()`'s 0xFF fill). `palette_set(entries)`
+  and `palette_set_entry(idx, color)` overwrite it at any time; the next VBL
+  picks it up. Build words with `PALETTE_RGB(r, g, b)` (0..7 per channel, ST
+  9-bit `0000.0RRR.0GGG.0BBB`; STE's 4th bit is left zero for compatibility).
+- Transport: `CART_PALETTE_OFFSET` = `$FA4040` (`SHARED_VARIABLES` slots
+  12–19, 32 B). `uint16_t` writes are transparent across the cart-bus
+  byte-swap, so the RP stores exactly the word the m68k reads.
+- m68k side: `.vbl_loop` in `userfw.s` MOVEM-copies the 32 bytes into
+  `$FFFF8240..$FFFF825E` every frame (~20 µs).
+
+Leaving the slot at zeros means an all-black palette (= black screen), not
+"no palette" — this is a common cause of "my app draws but the screen is
+blank". Palette cycling per frame is cheap and is what `demo_menu.c` and
+`demo_cojorotozoom.c` use for their colour "beating" / ramps.
 
 ### IKBD pipeline (keyboard input + ESC exit)
 
@@ -108,9 +158,24 @@ The earlier ROM4 + DMA-IRQ-per-read capture route (a first attempt) saturated th
 4. **m68k Timer-B handler plays the pair** (`userfw_timerb_audio`). MFP Timer-B is in /4 delay mode with TBDR=110 → 5,585.45 Hz, ~112 fires per PAL VBL. Each fire: `move.b (a0)+, $FFFF8802.w` (vA → ch A vol, reg 8 latched on entry) → `move.b #9, $FFFF8800.w` (latch reg 9) → `move.b (a0)+, $FFFF8802.w` (vB → ch B vol) → `move.b #8, $FFFF8800.w` (re-latch reg 8 for next fire) → `rte`. ~68 cyc handler body + ~44 cyc IRQ entry/exit = ~112 cyc/fire = ~1.57 ms/VBL = ~8% of the PAL VBL budget. MFP is in **auto-EOI mode** (VR S=0) so the in-service bit clears automatically per IACK cycle — no software EOI needed in the handler.
 5. **YM boot state** — boot enables channels A + B in the mixer (`MIXER = $FC`, tones on, noise off, periods=0 for a DC pass-through), zeroes both volumes, then latches reg 8 so the first Timer-B fire writes ch A directly.
 
+App-facing API (`audio.h`) — the library is format-agnostic, it just feeds
+bytes to the cart buffer:
+- `audio_init()` once at boot (leaves the buffer silent).
+- `audio_play_loop(data, bytes)` — loop a baked-in buffer forever (e.g.
+  `audio_sample_data[]` from `wav_to_ym4.py --header-output`).
+- `audio_play_yms_file(path)` — open a `.YMS` file from the SD folder and
+  stream it on loop. Format (from `wav_to_ym4.py --yms-output`): 16-byte
+  header — `'Y''M''S''1'`, LE `uint32` rate_hz, LE `uint32` data_len,
+  `uint8` mode_tag (1 = dual-ghost), 3 reserved — then the raw body. The
+  header's rate **must** match the m68k Timer-B rate or the call fails.
+  Returns <0 on any failure, leaving the previous callback installed —
+  `emul.c` uses that to try `DEMO.YMS` and fall back to the baked-in jingle.
+- `audio_set_fill_callback(cb)` — low-level; `cb(buf, bytes)` is invoked once
+  per VBL refill and must write exactly `bytes` bytes. `NULL` = silence.
+
 Tuning knobs:
 - `TIMERB_COUNT` in `userfw.s` controls the audio rate. Raise to slow (longer per-VBL audio slack), lower to speed (better fidelity at higher cost). Must match `AUDIO_BYTES_PER_VBL` in `rp/src/audio.c` (= 2 × fires-per-VBL for dual-channel mode) — otherwise the source pointer drifts.
-- Regenerate `audio_sample.h` at the matching rate via `python tools/wav_to_ym4.py --rate <Hz> --mode dual-ghost <source>` whenever the Timer-B rate changes — otherwise the jingle plays back pitched up/down by the ratio.
+- Regenerate `audio_sample.h` at the matching rate via `python3 tools/wav_to_ym4.py <source> --target-rate <Hz> --mode dual-ghost --header-output rp/src/include/audio_sample.h` (the flag is `--target-rate`, not `--rate`; add `--yms-output FILE.YMS` instead to produce an SD-streamable file) whenever the Timer-B rate changes — otherwise the jingle plays back pitched up/down by the ratio.
 - Audio uses no Atari RAM — the cart buffer at `$FA4100` is the entire I/O path. The handler keeps all state in registers (A0).
 
 ### Atari ST side (`target/atarist/`)
@@ -129,27 +194,28 @@ The Atari ST sees a 64 KB window at `$FA0000`–`$FAFFFF` (mirrored RP-side at `
 | `$FA4000` | `CMD_MAGIC_SENTINEL_ADDR` | 4 B | RP→m68k command word (`CMD_NOP`, `CMD_RESET`, `CMD_BOOT_GEM`, `CMD_START`). |
 | `$FA4004` | (reserved) | 8 B | Former RANDOM_TOKEN / RANDOM_TOKEN_SEED slots from the TPROTOCOL handshake; unused since that handshake was removed. |
 | `$FA400C` | `FB_FRAME_COUNTER_ADDR` | 4 B | RP-incremented dirty-frame counter; `userfw.s` only blits when this changes. |
-| `$FA4010` | `SHARED_VARIABLES` | 240 B | 60 × 4 B indexed slots. Slot 2 (`$FA4018`) is reserved for `AUDIO_CHUNK_COUNTER_ADDR` (placeholder; not used by the current VBL-edge-resync audio pipeline). Other slots free for apps. |
+| `$FA4010` | `SHARED_VARIABLES` | 240 B | 60 × 4 B indexed slots. Slot 2 (`$FA4018`) is reserved for `AUDIO_CHUNK_COUNTER_ADDR` (placeholder; not used by the current VBL-edge-resync audio pipeline). **Slots 12–19 (`$FA4040`–`$FA405F`) are `CART_PALETTE_OFFSET`** — the 16-word ST palette (see below). Remaining slots free for apps. |
 | `$FA4100` | `AUDIO_BUFFER_ADDR` | 1024 B | Audio buffer. Single contiguous block — the originally-planned A/B double-buffer collapsed into one buffer once we chose VBL-edge resync (m68k VBL handler resets A0 to buffer base every frame; RP refills the whole 1024 B per VBL). Default content: dual-channel Ghostbusters-LUT pairs at ~5,585 Hz (~224 B/VBL consumed; 800 B of headroom). |
 | `$FA4500` | `APP_FREE_ADDR` | ~15.5 KB | contiguous arena for app buffers, ends at FRAMEBUFFER. Apps that disable the audio pipeline can reclaim the 1 KB at `$FA4100`. |
 | `$FA8300` | `FRAMEBUFFER_ADDR` | 32000 B | 320×200×4bpp color framebuffer. Top of the region so an overrun walks off the end of the 64 KB window instead of corrupting the metadata block. Read by `FBDRV_INLINE` every VBL. |
 
 ### RP2040 side (`rp/src/`)
-- `main.c` — only sets clock/voltage, calls `gconfig_init` (global config) then `aconfig_init` (per-app config), and hands off to `emul_start()`. If config init fails it jumps to the **Booster** app via `reset_jump_to_booster()` to bootstrap. **Don't add features to `main.c`** — put them in `emul.c` or a new module.
+- `main.c` — only sets clock/voltage, calls `gconfig_init` (global config) then `aconfig_init` (per-app config), and hands off to `emul_start()`. If config init fails it jumps to the **Booster** app via `reset_jump_to_booster()` to bootstrap. It also holds the one deliberate exception to "keep main.c dumb": a hardware escape hatch that runs `select_configure()` + `select_detectPush()` **before** any config or emulation and jumps straight to Booster if the cartridge SELECT button is held at power-on — so the configurator is reachable even when this app's settings are wrong. **Don't add other features to `main.c`** — put them in `emul.c` or a new module.
 - `emul.c` / `emul.h` — the application's main loop and entry point. ~100 lines: erase + copy firmware to RAM, init IKBD ring, init romemul, init fb, init commemul, mount SD, configure SELECT, bring up the demo dispatcher (`demo_dispatcher_init()`), then loop `{fb_pump_rom3(); ikbd_pump(); drain key events → demo_dispatcher_handle_key(); demo_dispatcher_render_frame(); audio_render_frame();}`. `fb_pump_rom3()` (in `fb.c`) is the public wrapper that drains the ROM3 ring via `commemul_poll(fb_rom3_dispatch)` for IKBD demux + VBL frame-sync. The demo dispatcher (`demo_menu.c`) is the per-frame render driver; apps add foreground work inside that loop.
-- `fb.c` / `fb.h` — **owns the 32 KB planar framebuffer at `$FA8300` + the boot-time framebuffer setup.** `fb_init(&fb_mode_320x200)` populates `fb_screen` (pointer + width + height + bpp), calls `fb_chunked_init()` (which launches Core 1), builds the demo sprite, clears the planar FB to 0xFF (= palette index 15 = black on default TOS palette), and renders the initial frame. `fb_render_static()` / `fb_render_frame()` are the **legacy template render** (title + ESC hint + a bouncing sprite); they now only paint the initial frame — the per-frame loop is driven by the demo dispatcher (`demo_menu.c`), not `fb_render_frame`. `fb_publish()` (the VBL-synced transpose + cart-FB publish) is the call every demo uses.
+- `fb.c` / `fb.h` — **owns the 32 KB planar framebuffer at `$FA8300` + the boot-time framebuffer setup.** `fb_init(&fb_mode_320x200)` populates `fb_screen` (pointer + width + height + bpp), calls `fb_chunked_init()` (which launches Core 1), builds the demo sprite, clears the planar FB to 0xFF (= palette index 15 = black on default TOS palette), and renders the initial frame. `fb_render_static()` / `fb_render_frame()` are the **legacy template render** (title + ESC hint + a bouncing sprite); they now only paint the initial frame — the per-frame loop is driven by the demo dispatcher (`demo_menu.c`), not `fb_render_frame`. `fb_publish()` (the three-phase VBL handshake — see "VBL frame-sync handshake" above) is the call every demo uses; `fb_last_convert_us()` reports its cost.
 - `fb_chunked.c` / `fb_chunked.h` — **chunked off-screen buffer + dual-core publish dispatcher.** `fb_chunked_buffer[320 * 200]` is the byte-per-pixel render target apps draw into. `fb_chunked_init()` launches Core 1 with `fb_core1_loop`, a **generic job dispatcher**: `fb_core1_dispatch(fn, arg)` hands a function+arg to the parked Core 1 over the inter-core FIFO and `fb_core1_wait()` joins — the c2p bottom half and demos' own dual-core work both ride this one path. `fb_chunky_to_planar(planar)` runs c2p into `fb_planar_scratch` (32 KB in RP RAM, natural row-major planar layout) using both cores, then publishes scratch → cart FB via the `fb_chunk_reverse_copy48` Thumb asm worker (chunk-reversed `ldmia/stmia`) so the m68k's predec MOVEM blit lands each 48-byte chunk at its natural image position. The chunk-reversal mapping is specified in `cart_shared.h`.
 - `fb_chunked_asm.S` — **hand-written Thumb assembly worker.** `fb_c2p_half(dst, src, src_end)` processes a chunked range using a multiplication-based bit transpose (`((q & 0x01010101) * 0x80402010) >> 28` packs a 4-pixel plane bit into a nibble in one MUL). Writes natural row-major planar output to `dst` — chunk reversal happens in the dispatcher (`fb_chunky_to_planar`), not the worker. Both cores execute this same code on their respective halves. No LUTs in scratch; only two 32-bit constants in registers.
-- `fb_font.c` / `fb_font.h` — text primitives. `font_set_font(&font6x8)`, `font_set_color(0)` for palette-index-0 (white on default TOS), `font_move(x, y)`, `font_print(str)`. `render_text` writes single bytes into `fb_chunked_buffer` (no LUT, no plane math) so the cart-bus byte-swap is irrelevant at the font layer.
+- `fb_font.c` / `fb_font.h` — text primitives. `font_set_font(&font8x8)`, `font_set_color(0)` for palette-index-0 (white on default TOS), `font_move(x, y)`, `font_print(str)`. `render_text` writes single bytes into `fb_chunked_buffer` (no LUT, no plane math) so the cart-bus byte-swap is irrelevant at the font layer.
 - `fb_blit.c` / `fb_blit.h` / `fb_blit_asm.S` — bitmap / sprite primitives. `fb_fill_rect(x, y, w, h, color)`, `fb_blit(bm, dst_x, dst_y)` (opaque memcpy per row), `fb_blit_key(bm, dst_x, dst_y, key)` (color-key transparent sprite, inner row in the `fb_blit_key_row` Thumb asm). `_band` variants (`fb_blit_band` / `fb_blit_key_band`) clip vertically to `[y0, y1)` so two cores can render disjoint screen bands. All target the chunked buffer.
-- `font6x8.h` — 6×8 ASCII font data + the `FB_FONT font6x8` instance definition. Include from exactly one .c file (currently `fb.c`) to avoid multiple-definition link errors.
+- `palette.c` / `palette.h` — 16-entry ST hardware-palette publisher into the cart slot at `$FA4040`; the m68k VBL handler applies it every frame. See "Palette pipeline" above.
+- `font8x8.h` — 8×8 ASCII font data + the `FB_FONT font8x8` instance definition. Include from exactly one .c file (currently `fb.c`) to avoid multiple-definition link errors.
 - **Demo suite** (`demo_menu.c` + `demo_*.c`) — an animated boot menu over four self-contained demos, each a worked example of "draw into the chunked buffer, publish via `fb_publish`". `demo_menu.c` is the dispatcher (MENU ⇄ ACTIVE state machine; up/down + Return or the number keys launch the highlighted demo, ESC backs out / second ESC exits to GEM) and defines the `demo_module_t` interface in `demo.h` (`init` / `render_frame` / `handle_key` / `teardown`) plus the shared `g_show_timing` flag — the hidden `D` key toggles the DRAW/C2P readout in the menu and every demo. The menu is itself a demo: two SidecarTridge logos rotozoomed (INTERP0 texel addressing) with colour-cycling "beating" palettes that dip to black, generated from PNGs by `tools/png_to_texture.py` (`sidecart_logo.h` / `sidecart_text.h`). The demos: `demo_parallax.c` (Uridium-style 3-layer scroll), `demo_3d.c` + `solid3d.h` (flat-shaded geodesic-sphere vector object), `demo_sprites.c` (auto-scaling sprite swarm), `demo_cojorotozoom.c` (full-screen logo rotozoom). They're the reference for the optimization techniques worth copying into new apps: per-file `#pragma GCC optimize("O3")` on hot compute files, `__not_in_flash_func()` on per-frame loops, 8.8 fixed-point with sin/cos LUTs + power-of-two `&`-mask tiling, the SIO **interpolator** in texture-mapping mode (`demo_cojorotozoom.c`), and the **dual-core band split** via `fb_core1_dispatch` + the `_band` blits (`demo_sprites.c`).
 - `romemul.c` / `romemul.pio` — PIO programs and the runtime that emulates the cartridge ROM/RAM bus to the Atari (driven by `READ_*` / `WRITE_*` GPIOs defined in `include/constants.h`).
 - `commemul.c` / `commemul.pio` — **ROM3 cart-bus capture ring; the primary extension point for reading anything the m68k forwards via cart reads in `$FB0000`–`$FBFFFF`.** `commemul_init()` starts a PIO+DMA chain that records every ROM3 read into a 32 KB ring buffer with no CPU/IRQ involvement. The main loop drains it via `commemul_poll(callback)`; each captured 16-bit sample is the cart-bus address that was read (low byte typically carries the payload, high byte the discriminator window — see `ikbd.c` for the canonical example at `$FB8200..$FB82FF`). The upstream `chandler.c` + `tprotocol.h` command-dispatch layer that previously sat on top of commemul was removed — apps that need a multi-byte command channel can wrap `commemul_poll` with their own callback.
 - `gconfig.c` / `aconfig.c` — global vs per-app configuration stored in dedicated flash sectors, on top of `settings/` (a key-value store). The global-config defaults in `gconfig.c` mirror the Booster app and include WiFi parameters even though this template no longer brings up networking — **do not trim them**.
 - `sdcard.c`, `hw_config.c` — FatFs over SPI/SDIO via the bundled `fatfs-sdk`.
-- `select.c`, `reset.c` — SELECT-button handling, soft reset/jump-to-booster.
-- `ikbd.c` / `ikbd.h` — IKBD keyboard ingest + demux. Chained off `commemul_poll` in the main loop; filters the `$FB8200..$FB82FF` window and decodes scancodes into a key-event ring (`ikbd_pop_key`). ESC press+release within 200 ms signals m68k exit via `CART_CMD_BOOT_GEM`. See `cart_shared.h` for the shared-region constants.
+- `select.c`, `reset.c` — SELECT-button handling (debounced press/long-press detection, plus the `select_detectPush()` used by `main.c`'s power-on Booster escape hatch), soft reset / `reset_jump_to_booster()`.
+- `ikbd.c` / `ikbd.h` — IKBD keyboard ingest + demux. Chained off `commemul_poll` in the main loop; filters the `$FB8200..$FB82FF` window and decodes scancodes into a key-event ring (`ikbd_pop_key`). ESC press+release within 200 ms signals m68k exit via `CART_CMD_BOOT_GEM` — but only while that auto-exit is armed: `ikbd_set_esc_auto_exit(false)` hands ESC to the caller, which is exactly what `demo_dispatcher_init()` does so ESC can mean "back to menu" inside a demo. See `cart_shared.h` for the shared-region constants.
 
 The `display.c` / `term.c` / `u8g2/` subsystem from upstream `md-microfirmware-template` was deleted — the framebuffer template's UI is just "draw into `fb_screen`".
 
@@ -167,7 +233,7 @@ The RP2040's 2 MB flash is sliced into named regions, and code is responsible fo
 | `RAM` | `0x20000000` | 128 K | Normal RAM |
 | `ROM_IN_RAM` | `0x20020000` | 128 K | ROM data mirrored to RAM for fast bus access |
 
-The build assumes Core 0 owns flash writes (`PICO_FLASH_ASSUME_CORE0_SAFE=1`). The PIO bus emulation runs hot — Core 0 also overclocks to 225 MHz at `VREG_VOLTAGE_1_10`. **Core 1 is owned by `fb_c2p_core1_loop`** (the chunky-to-planar bottom-half worker, see `fb_chunked.c`); apps that want Core 1 for other purposes need to replace that worker or refactor the conversion pipeline.
+The build assumes Core 0 owns flash writes (`PICO_FLASH_ASSUME_CORE0_SAFE=1`). The PIO bus emulation runs hot — Core 0 also overclocks to 225 MHz at `VREG_VOLTAGE_1_10`. **Core 1 is owned by `fb_core1_loop`** (`fb_chunked.c`) — a parked generic job runner, not a c2p-only worker. Apps get Core 1 through it: `fb_core1_dispatch(fn, arg)` + `fb_core1_wait()` (see `demo_sprites.c`'s band split). Each dispatch must be joined before the next one, and before `fb_publish()` — the c2p bottom half rides the same FIFO.
 
 ### App identity
 `CURRENT_APP_UUID_KEY` (set from the `APP_UUID_KEY` env var at CMake time, with a placeholder default) is the app's UUID4. It must match the `uuid` field in `desc/app.json` and is used as the key into `GLOBAL_LOOKUP_FLASH` to find this app's config sector. Mismatch → app jumps to Booster.
